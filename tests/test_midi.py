@@ -4,8 +4,10 @@ import unittest
 from fractions import Fraction
 
 from app.midi import (
+    AUDIBLE_NOTES_PROJECTION,
     MAX_TRACKS_PLUS_EVENTS,
     MidiError,
+    ProjectionError,
     build_tempo_segments,
     normalize,
     parse,
@@ -46,6 +48,21 @@ def tempo(delta, us):
 
 def ev(delta, *bs):
     return varlen(delta) + bytes(bs)
+
+
+def note_on(delta, ch, pitch, vel):
+    return ev(delta, 0x90 | ch, pitch, vel)
+
+
+def note_off(delta, ch, pitch, vel=0):
+    return ev(delta, 0x80 | ch, pitch, vel)
+
+
+def cc(delta, ch, controller, value):
+    return ev(delta, 0xB0 | ch, controller, value)
+
+
+SUSTAIN = 64
 
 
 EOT = ev(0, 0xFF, 0x2F, 0x00)
@@ -365,6 +382,334 @@ class OrderingTests(unittest.TestCase):
             fractions(result),
             [Fraction(0)] + [Fraction(125000)] + [Fraction(250000)] * 3,
         )
+
+
+# -- audible notes projection ------------------------------------------------
+
+
+def note_tuple(note):
+    """Compact (ch, pitch, vel, start_t, release_t, end_t) for assertions."""
+    return (
+        note["channel"],
+        note["pitch"],
+        note["velocity"],
+        note["start"]["tick"],
+        note["release"]["tick"],
+        note["end"]["tick"],
+    )
+
+
+class AudibleNotesTests(unittest.TestCase):
+    def _normalize(self, payload, ntracks=1, fmt=1, ppqn=480):
+        tracks = payload if isinstance(payload, list) else [payload]
+        data = header(fmt, ntracks, ppqn) + b"".join(
+            track(p) for p in tracks
+        )
+        return normalize(data, projection=AUDIBLE_NOTES_PROJECTION)
+
+    def test_no_projection_keeps_response_compatible(self):
+        payload = note_on(0, 0, 60, 100) + note_off(10, 0, 60) + EOT
+        result = normalize(header(1, 1, 480) + track(payload))
+        self.assertNotIn("notes", result)
+        self.assertIn("events", result)
+
+    def test_explicit_none_projection_keeps_response_compatible(self):
+        payload = note_on(0, 0, 60, 100) + note_off(10, 0, 60) + EOT
+        result = normalize(header(1, 1, 480) + track(payload), projection=None)
+        self.assertNotIn("notes", result)
+
+    def test_simple_note_off(self):
+        payload = (
+            note_on(0, 0, 60, 110)
+            + note_off(480, 0, 60)
+            + EOT
+        )
+        result = self._normalize(payload)
+        notes = result["notes"]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(note_tuple(notes[0]), (0, 60, 110, 0, 480, 480))
+        # Events are still present and ordered as before.
+        self.assertEqual(len(result["events"]), 2)
+        self.assertEqual(
+            [(e["tick"], e["track"], e["order"]) for e in result["events"]],
+            [(0, 0, 0), (480, 0, 1)],
+        )
+
+    def test_zero_velocity_note_on_releases(self):
+        payload = (
+            note_on(0, 0, 60, 90)
+            + note_on(480, 0, 60, 0)  # zero-velocity note on == release
+            + EOT
+        )
+        result = self._normalize(payload)
+        self.assertEqual(
+            note_tuple(result["notes"][0]), (0, 60, 90, 0, 480, 480)
+        )
+
+    def test_note_off_velocity_is_ignored(self):
+        payload = (
+            note_on(0, 0, 60, 90)
+            + note_off(480, 0, 60, vel=64)
+            + EOT
+        )
+        result = self._normalize(payload)
+        self.assertEqual(
+            note_tuple(result["notes"][0]), (0, 60, 90, 0, 480, 480)
+        )
+
+    def test_notes_sorted_by_attack_order(self):
+        # All attacks share tick 0; track order decides attack order even
+        # though pitches are out of order across tracks.
+        t0 = note_on(0, 0, 70, 100) + note_off(0, 0, 70) + EOT
+        t1 = note_on(0, 1, 60, 100) + note_off(0, 1, 60) + EOT
+        t2 = note_on(0, 2, 64, 100) + note_off(0, 2, 64) + EOT
+        result = self._normalize([t0, t1, t2], ntracks=3)
+        self.assertEqual(
+            [(n["channel"], n["pitch"]) for n in result["notes"]],
+            [(0, 70), (1, 60), (2, 64)],
+        )
+
+    def test_notes_attack_order_across_ticks(self):
+        # Track index is lower but the attack lands later: tick dominates.
+        t0 = note_on(240, 0, 60, 100) + note_off(0, 0, 60) + EOT
+        t1 = note_on(0, 1, 64, 100) + note_off(240, 1, 64) + EOT
+        result = self._normalize([t0, t1], ntracks=2)
+        self.assertEqual(
+            [(n["channel"], n["pitch"]) for n in result["notes"]],
+            [(1, 64), (0, 60)],
+        )
+
+    def test_cross_track_same_tick_attack_then_release(self):
+        # Attack and release on the same channel/pitch land in different
+        # tracks at the same tick; track order makes attack come first.
+        attacks = note_on(0, 0, 60, 100) + EOT
+        releases = note_off(0, 0, 60) + EOT
+        result = self._normalize([attacks, releases], ntracks=2)
+        self.assertEqual(
+            note_tuple(result["notes"][0]), (0, 60, 100, 0, 0, 0)
+        )
+
+    def test_cross_track_same_tick_release_first_fails(self):
+        # Track 0 releases before track 1 attacks at the same tick.
+        releases = note_off(0, 0, 60) + EOT
+        attacks = note_on(0, 0, 60, 100) + EOT
+        with self.assertRaises(ProjectionError) as ctx:
+            self._normalize([releases, attacks], ntracks=2)
+        self.assertEqual(ctx.exception.code, "unmatched_note_off")
+
+    def test_sustain_pedal_extends_end(self):
+        payload = (
+            cc(0, 0, SUSTAIN, 64)       # pedal down
+            + note_on(0, 0, 60, 100)
+            + note_off(240, 0, 60)      # key released at 240
+            + cc(240, 0, SUSTAIN, 0)    # pedal up at 480: audible end
+            + EOT
+        )
+        result = self._normalize(payload)
+        self.assertEqual(
+            note_tuple(result["notes"][0]), (0, 60, 100, 0, 240, 480)
+        )
+
+    def test_sustain_threshold_boundary(self):
+        # Value 63 is pedal up; 64 is down.
+        payload = (
+            cc(0, 0, SUSTAIN, 63)
+            + note_on(0, 0, 60, 100)
+            + note_off(240, 0, 60)
+            + EOT
+        )
+        result = self._normalize(payload)
+        self.assertEqual(
+            note_tuple(result["notes"][0]), (0, 60, 100, 0, 240, 240)
+        )
+
+    def test_pedal_stays_down_repeated_cc_does_not_end(self):
+        payload = (
+            cc(0, 0, SUSTAIN, 100)
+            + note_on(0, 0, 60, 100)
+            + note_off(100, 0, 60)
+            + cc(100, 0, SUSTAIN, 80)   # still down
+            + cc(100, 0, SUSTAIN, 127)  # still down
+            + cc(100, 0, SUSTAIN, 63)   # up: ends at tick 400
+            + EOT
+        )
+        result = self._normalize(payload)
+        self.assertEqual(
+            note_tuple(result["notes"][0]), (0, 60, 100, 0, 100, 400)
+        )
+
+    def test_pedal_up_ends_all_sustained_on_channel(self):
+        payload = (
+            cc(0, 0, SUSTAIN, 127)
+            + note_on(0, 0, 60, 100)
+            + note_on(0, 0, 64, 90)
+            + note_off(120, 0, 60)
+            + note_off(120, 0, 64)
+            + cc(120, 0, SUSTAIN, 0)
+            + cc(0, 1, SUSTAIN, 127)    # other channel: pedal down but no note
+            + EOT
+        )
+        result = self._normalize(payload)
+        self.assertEqual(
+            sorted(note_tuple(n) for n in result["notes"]),
+            [
+                (0, 60, 100, 0, 120, 360),
+                (0, 64, 90, 0, 240, 360),
+            ],
+        )
+
+    def test_sustain_per_channel_isolation(self):
+        # Channel 1's pedal-down CC must not suspend a channel 0 release.
+        payload = (
+            cc(0, 1, SUSTAIN, 127)
+            + note_on(0, 0, 60, 100)
+            + note_off(100, 0, 60)
+            + EOT
+        )
+        result = self._normalize(payload)
+        self.assertEqual(
+            note_tuple(result["notes"][0]), (0, 60, 100, 0, 100, 100)
+        )
+
+    def test_sustain_left_down_on_other_channel_fails(self):
+        payload = (
+            cc(0, 1, SUSTAIN, 127)
+            + note_on(0, 1, 60, 100)
+            + note_off(100, 1, 60)
+            + EOT
+        )
+        with self.assertRaises(ProjectionError) as ctx:
+            self._normalize(payload)
+        self.assertEqual(ctx.exception.code, "unterminated_notes")
+
+    def test_reattack_same_pitch_while_sustained(self):
+        payload = (
+            cc(0, 0, SUSTAIN, 127)
+            + note_on(0, 0, 60, 100)
+            + note_off(240, 0, 60)      # parked by pedal
+            + note_on(0, 0, 60, 80)     # re-attack allowed while sustained
+            + note_off(240, 0, 60)
+            + cc(240, 0, SUSTAIN, 0)    # both end at 720
+            + EOT
+        )
+        result = self._normalize(payload)
+        self.assertEqual(
+            [note_tuple(n) for n in result["notes"]],
+            [
+                (0, 60, 100, 0, 240, 720),
+                (0, 60, 80, 240, 480, 720),
+            ],
+        )
+
+    def test_repeated_note_on_without_release_fails(self):
+        payload = (
+            note_on(0, 0, 60, 100)
+            + note_on(240, 0, 60, 90)
+            + note_off(0, 0, 60)
+            + EOT
+        )
+        with self.assertRaises(ProjectionError) as ctx:
+            self._normalize(payload)
+        self.assertEqual(ctx.exception.code, "repeated_note_on")
+
+    def test_unmatched_note_off_fails(self):
+        payload = note_off(0, 0, 60) + EOT
+        with self.assertRaises(ProjectionError) as ctx:
+            self._normalize(payload)
+        self.assertEqual(ctx.exception.code, "unmatched_note_off")
+
+    def test_unmatched_zero_velocity_note_on_fails(self):
+        payload = note_on(0, 0, 60, 0) + EOT
+        with self.assertRaises(ProjectionError) as ctx:
+            self._normalize(payload)
+        self.assertEqual(ctx.exception.code, "unmatched_note_off")
+
+    def test_unterminated_held_note_fails(self):
+        payload = note_on(0, 0, 60, 100) + EOT  # never released
+        with self.assertRaises(ProjectionError) as ctx:
+            self._normalize(payload)
+        self.assertEqual(ctx.exception.code, "unterminated_notes")
+
+    def test_unterminated_sustained_note_fails(self):
+        payload = (
+            cc(0, 0, SUSTAIN, 127)
+            + note_on(0, 0, 60, 100)
+            + note_off(100, 0, 60)
+            + EOT  # pedal never comes up
+        )
+        with self.assertRaises(ProjectionError) as ctx:
+            self._normalize(payload)
+        self.assertEqual(ctx.exception.code, "unterminated_notes")
+
+    def test_non_sustain_cc_ignored(self):
+        payload = (
+            cc(0, 0, 7, 127)           # volume, not sustain
+            + note_on(0, 0, 60, 100)
+            + note_off(100, 0, 60)
+            + EOT
+        )
+        result = self._normalize(payload)
+        self.assertEqual(
+            note_tuple(result["notes"][0]), (0, 60, 100, 0, 100, 100)
+        )
+
+    def test_other_channel_events_do_not_match(self):
+        payload = (
+            note_on(0, 0, 60, 100)
+            + note_off(0, 1, 60)       # different channel -> unmatched
+            + note_off(0, 0, 60)
+            + EOT
+        )
+        with self.assertRaises(ProjectionError) as ctx:
+            self._normalize(payload)
+        self.assertEqual(ctx.exception.code, "unmatched_note_off")
+
+    def test_tempo_changes_apply_to_note_fractions(self):
+        conductor = (
+            tempo(0, 500000)
+            + tempo(480, 250000)
+            + EOT
+        )
+        notes = (
+            cc(0, 0, SUSTAIN, 127)
+            + note_on(0, 0, 60, 100)   # tick 0
+            + note_off(480, 0, 60)     # release tick 480
+            + cc(480, 0, SUSTAIN, 0)   # end tick 960
+            + EOT
+        )
+        result = self._normalize([conductor, notes], ntracks=2)
+        n = result["notes"][0]
+        self.assertEqual(n["start"]["time_us"]["fraction"], "0/1")
+        self.assertEqual(n["release"]["time_us"]["fraction"], "500000/1")
+        # 480 ticks @ 500000 -> 500000 us; 480 ticks @ 250000 -> 250000 us.
+        self.assertEqual(n["end"]["time_us"]["fraction"], "750000/1")
+
+    def test_fractional_microseconds_reduced(self):
+        # ppqn 480, one tick = 500000/480 = 3125/3 us.
+        payload = (
+            note_on(0, 0, 60, 100)
+            + note_off(1, 0, 60)
+            + EOT
+        )
+        result = self._normalize(payload)
+        n = result["notes"][0]
+        self.assertEqual(n["start"]["time_us"]["fraction"], "0/1")
+        self.assertEqual(n["release"]["time_us"]["fraction"], "3125/3")
+        self.assertEqual(n["end"]["time_us"]["fraction"], "3125/3")
+
+    def test_note_payload_fields(self):
+        payload = note_on(0, 3, 72, 127) + note_off(10, 3, 72) + EOT
+        result = self._normalize(payload)
+        n = result["notes"][0]
+        self.assertEqual(n["channel"], 3)
+        self.assertEqual(n["pitch"], 72)
+        self.assertEqual(n["velocity"], 127)
+        for key in ("start", "release", "end"):
+            self.assertIn("tick", n[key])
+            self.assertEqual(
+                set(n[key]["time_us"]),
+                {"numerator", "denominator", "fraction"},
+            )
 
 
 if __name__ == "__main__":

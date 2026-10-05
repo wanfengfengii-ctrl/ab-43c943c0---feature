@@ -10,8 +10,15 @@ from __future__ import annotations
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
-from .midi import MAX_FILE_BYTES, MidiError, normalize
+from .midi import (
+    AUDIBLE_NOTES_PROJECTION,
+    MAX_FILE_BYTES,
+    MidiError,
+    ProjectionError,
+    normalize,
+)
 
 NORMALIZE_PATH = "/api/midi/normalize"
 _DRAIN_CAP = 32 << 20  # never read more than this when rejecting oversize bodies
@@ -63,10 +70,15 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "not_found", f"unknown path: {path}")
 
     def do_POST(self) -> None:
-        path = self.path.split("?", 1)[0]
+        path, _, query_string = self.path.partition("?")
         if path != NORMALIZE_PATH:
             self._error(404, "not_found", f"unknown path: {path}")
             return
+
+        projection = None
+        query = parse_qs(query_string, keep_blank_values=True)
+        if "projection" in query:
+            projection = query["projection"][-1]
 
         length_header = self.headers.get("Content-Length")
         if length_header is None:
@@ -101,12 +113,28 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        # Validate after consuming the body so a keep-alive connection stays
+        # usable for the next request.
+        if projection is not None and projection != AUDIBLE_NOTES_PROJECTION:
+            self._error(
+                400,
+                "invalid_projection",
+                f"unknown projection {projection!r}; supported values are: "
+                f"{AUDIBLE_NOTES_PROJECTION!r}",
+            )
+            return
+
         try:
-            result = normalize(body)
+            result = normalize(body, projection=projection)
         except MidiError as exc:
             # Structural failure: report the locating offset, never a
             # partial timeline.
             self._error(400, exc.code, exc.message, offset=exc.offset)
+            return
+        except ProjectionError as exc:
+            # Semantic projection failure: no partial projection is ever
+            # produced.
+            self._error(422, exc.code, exc.message)
             return
         self._send_json(200, result)
 

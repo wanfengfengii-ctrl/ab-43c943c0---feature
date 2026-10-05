@@ -13,11 +13,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 MAX_FILE_BYTES = 1 << 20  # 1 MiB
 MAX_TRACKS_PLUS_EVENTS = 10_000
 DEFAULT_TEMPO_US_PER_QUARTER = 500_000
+
+AUDIBLE_NOTES_PROJECTION = "audible_notes"
+SUSTAIN_CONTROLLER = 64  # CC64: hold/damper pedal
+SUSTAIN_ON_THRESHOLD = 64  # CC64 value >= 64 means pedal down
 
 CHANNEL_EVENT_NAMES = {
     0x80: "note_off",
@@ -41,6 +45,19 @@ class MidiError(Exception):
         self.code = code
         self.message = message
         self.offset = offset
+
+
+class ProjectionError(Exception):
+    """A semantic problem in a derived projection (e.g. audible notes).
+
+    Unlike :class:`MidiError` there is no locating byte offset: the file is
+    structurally valid, but its event stream cannot describe the projection.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 @dataclass
@@ -356,8 +373,119 @@ def time_at_tick(
     return total
 
 
-def normalize(data: bytes) -> dict:
-    """Parse ``data`` and return the normalized channel-event timeline."""
+@dataclass
+class _Note:
+    channel: int
+    pitch: int
+    velocity: int
+    start_tick: int
+    release_tick: Optional[int] = None
+    end_tick: Optional[int] = None
+
+
+def project_audible_notes(
+    ordered_events: List[ChannelEvent],
+) -> List[_Note]:
+    """Derive audible note intervals from the ordered channel-event stream.
+
+    Rules:
+
+    * a positive-velocity ``note_on`` starts a note;
+    * a ``note_off`` (or zero-velocity ``note_on``) releases the key of the
+      same channel and pitch that is currently held down;
+    * while CC64 is at least 64 the released note keeps sounding and is
+      parked in a per-channel sustain set.  The first CC64 value below 64
+      ends every sustained note on that channel at that tick;
+    * the same pitch may be re-attacked while an earlier instance of it is
+      still held by the pedal.
+
+    Semantic failures raise :class:`ProjectionError`: an attack while the
+    same key is already held, a release with no held key, or notes that are
+    still sounding at the end of the file.
+    """
+    # channel -> {pitch: currently held (unreleased) note}
+    held: Dict[int, Dict[int, _Note]] = {}
+    # channel -> {pitch: [released but still audible notes]} (parked by pedal)
+    sustained: Dict[int, Dict[int, List[_Note]]] = {}
+    # channel -> pedal currently down (CC64 >= 64); default is up
+    pedal: Dict[int, bool] = {}
+    notes: List[_Note] = []
+
+    for event in ordered_events:
+        ch = event.channel
+        if event.kind == 0xB0 and event.data[0] == SUSTAIN_CONTROLLER:
+            down = event.data[1] >= SUSTAIN_ON_THRESHOLD
+            was_down = pedal.get(ch, False)
+            pedal[ch] = down
+            if was_down and not down:
+                # Pedal comes up: everything parked on this channel ends now.
+                for parked in sustained.pop(ch, {}).values():
+                    for note in parked:
+                        note.end_tick = event.tick
+            continue
+
+        if event.kind == 0x90:
+            pitch, velocity = event.data[0], event.data[1]
+            if velocity > 0:
+                held_ch = held.setdefault(ch, {})
+                if pitch in held_ch:
+                    raise ProjectionError(
+                        "repeated_note_on",
+                        f"channel {ch}: note {pitch} is attacked again at tick "
+                        f"{event.tick} before being released",
+                    )
+                note = _Note(
+                    channel=ch,
+                    pitch=pitch,
+                    velocity=velocity,
+                    start_tick=event.tick,
+                )
+                held_ch[pitch] = note
+                notes.append(note)
+            else:
+                _release_note(held, sustained, pedal, ch, event.tick, pitch)
+        elif event.kind == 0x80:
+            _release_note(held, sustained, pedal, ch, event.tick, event.data[0])
+
+    problems = [
+        (note.channel, note.pitch, note.start_tick)
+        for note in notes
+        if note.end_tick is None
+    ]
+    if problems:
+        ch, pitch, tick = problems[0]
+        raise ProjectionError(
+            "unterminated_notes",
+            f"channel {ch}: note {pitch} attacked at tick {tick} is still "
+            "sounding at end of file",
+        )
+    return notes
+
+
+def _release_note(held, sustained, pedal, ch, tick, pitch) -> None:
+    held_ch = held.get(ch)
+    note = held_ch.pop(pitch) if held_ch and pitch in held_ch else None
+    if note is None:
+        raise ProjectionError(
+            "unmatched_note_off",
+            f"channel {ch}: note {pitch} released at tick {tick} with no key "
+            "currently held",
+        )
+    note.release_tick = tick
+    if pedal.get(ch, False):
+        sustained.setdefault(ch, {}).setdefault(pitch, []).append(note)
+    else:
+        note.end_tick = tick
+
+
+def normalize(data: bytes, projection: Optional[str] = None) -> dict:
+    """Parse ``data`` and return the normalized channel-event timeline.
+
+    With ``projection="audible_notes"`` the response additionally carries a
+    ``notes`` list of audible note intervals.  Any projection failure raises
+    :class:`ProjectionError`; the caller maps that to HTTP 422 and must not
+    return a partial projection.
+    """
     parsed = parse(data)
     segments = build_tempo_segments(parsed.tempo_events)
     ordered = sorted(
@@ -381,10 +509,37 @@ def normalize(data: bytes) -> dict:
                 },
             }
         )
-    return {
+    result = {
         "format": parsed.fmt,
         "ppqn": parsed.ppqn,
         "track_count": parsed.ntracks,
         "channel_event_count": len(events),
         "events": events,
+    }
+    if projection == AUDIBLE_NOTES_PROJECTION:
+        projected = project_audible_notes(ordered)
+        result["notes"] = [
+            {
+                "channel": note.channel,
+                "pitch": note.pitch,
+                "velocity": note.velocity,
+                "start": _instant(note.start_tick, segments, parsed.ppqn),
+                "release": _instant(note.release_tick, segments, parsed.ppqn),
+                "end": _instant(note.end_tick, segments, parsed.ppqn),
+            }
+            for note in projected
+        ]
+    return result
+
+
+def _instant(tick: int, segments: List[Tuple[int, int]], ppqn: int) -> dict:
+    """A ``{tick, time_us}`` instant with a reduced microsecond fraction."""
+    moment = time_at_tick(tick, segments, ppqn)
+    return {
+        "tick": tick,
+        "time_us": {
+            "numerator": moment.numerator,
+            "denominator": moment.denominator,
+            "fraction": f"{moment.numerator}/{moment.denominator}",
+        },
     }

@@ -4,7 +4,10 @@ Runs, in order:
   1. code tests   -- the unit-test suite (stdlib unittest)
   2. build check  -- byte-compile every source tree and import the modules
   3. API smoke    -- POST a multi-track, tempo-changing format-1 file plus
-                     structural-error cases to a healthy app container
+                     structural-error cases to a healthy app container; with
+                     ?projection=audible_notes also covers cross-track
+                     same-tick attacks, tempo changes, sustain-pedal parking
+                     and the 422 semantic-failure regressions
 
 Every step is reported on stdout; the process exit code is 0 only when all
 steps pass, so `docker compose up --exit-code-from verify verify` surfaces
@@ -57,7 +60,24 @@ def ev(delta, *bs):
     return varlen(delta) + bytes(bs)
 
 
+def note_on(delta, ch, pitch, vel):
+    return ev(delta, 0x90 | ch, pitch, vel)
+
+
+def note_off(delta, ch, pitch, vel=0):
+    return ev(delta, 0x80 | ch, pitch, vel)
+
+
+def cc(delta, ch, controller, value):
+    return ev(delta, 0xB0 | ch, controller, value)
+
+
+SUSTAIN = 64
+
+
 EOT = ev(0, 0xFF, 0x2F, 0x00)
+
+AUDIBLE_NOTES_PROJECTION = "audible_notes"
 
 
 def build_smoke_file():
@@ -108,9 +128,10 @@ EXPECTED_EVENTS = [
 # -- helpers -----------------------------------------------------------------
 
 
-def post(body):
+def post(body, query=""):
+    url = APP_URL + "/api/midi/normalize" + query
     request = urllib.request.Request(
-        APP_URL + "/api/midi/normalize",
+        url,
         data=body,
         headers={"Content-Type": "application/octet-stream"},
         method="POST",
@@ -274,7 +295,170 @@ def step_api_smoke():
         f"got {body}",
     )
 
+    _check_audible_notes(suite)
+
     return not suite.failures
+
+
+def _check_audible_notes(suite):
+    """?projection=audible_notes: cross-track, tempo, sustain, 422 cases."""
+    query = "?projection=" + AUDIBLE_NOTES_PROJECTION
+
+    # -- compatibility: omitted projection never returns notes -------------
+    status, body = post(build_smoke_file())
+    suite.check("no projection: still 200", status == 200, f"got {status}")
+    suite.check("no projection: no notes key", "notes" not in body)
+
+    # -- invalid projection value ------------------------------------------
+    status, body = post(build_smoke_file(), "?projection=bogus")
+    suite.check("bad projection: HTTP 400", status == 400, f"got {status}")
+    suite.check(
+        "bad projection: code",
+        body.get("error", {}).get("code") == "invalid_projection",
+        f"got {body.get('error')}",
+    )
+
+    # -- happy path: sustain + cross-track same tick + tempo changes -------
+    # Tempo map on track 0: 500000 us/qn until tick 480, 250000 afterwards.
+    conductor = tempo(0, 500000) + tempo(480, 250000) + EOT
+    # Track 1: a note attacked at tick 0, key released at 240, sustained by
+    # CC64 until pedal-up at tick 960.
+    sustained_track = (
+        cc(0, 0, SUSTAIN, 127)       # tick 0 pedal down
+        + note_on(0, 0, 60, 110)     # tick 0 attack
+        + note_off(240, 0, 60)       # tick 240 key release (still audible)
+        + cc(720, 0, SUSTAIN, 0)     # tick 960 pedal up -> audible end
+        + EOT
+    )
+    # Track 2: attacks at tick 0, same tick as the track-1 attack (cross
+    # track same-tick ordering must decide attack sequence), released at 480
+    # with pedal up -> release equals end.
+    plain_track = (
+        note_on(0, 1, 72, 95)
+        + note_off(480, 1, 72)
+        + EOT
+    )
+    happy = header(1, 3, 480) + track(conductor) + track(sustained_track) + track(plain_track)
+    status, body = post(happy, query)
+    suite.check("audible notes: 200", status == 200, f"got {status}: {body}")
+    if status != 200:
+        return
+    suite.check("audible notes: events retained", len(body.get("events", [])) == 6)
+    notes = body.get("notes")
+    suite.check("audible notes: 2 notes", isinstance(notes, list) and len(notes) == 2,
+                f"got {notes}")
+    if not (isinstance(notes, list) and len(notes) == 2):
+        return
+
+    # Attack order follows (tick, track, order): track 1 first, then track 2.
+    n0, n1 = notes
+    suite.check(
+        "note 0 identity",
+        (n0.get("channel"), n0.get("pitch"), n0.get("velocity")) == (0, 60, 110),
+        f"got {n0}",
+    )
+    suite.check(
+        "note 1 identity",
+        (n1.get("channel"), n1.get("pitch"), n1.get("velocity")) == (1, 72, 95),
+        f"got {n1}",
+    )
+    # Note 0: attack 0, key release 240, audible end 960 (pedal).
+    suite.check(
+        "sustained note ticks",
+        (n0["start"]["tick"], n0["release"]["tick"], n0["end"]["tick"])
+        == (0, 240, 960),
+        f"got {n0}",
+    )
+    # Timing: release at 240 -> 250000 us; end at 960 -> 500000 + 250000.
+    suite.check(
+        "sustained note start fraction",
+        n0["start"]["time_us"]["fraction"] == "0/1",
+    )
+    suite.check(
+        "sustained note release fraction",
+        n0["release"]["time_us"]["fraction"] == "250000/1",
+        f"got {n0['release']['time_us']}",
+    )
+    suite.check(
+        "sustained note end fraction (tempo change applied)",
+        n0["end"]["time_us"]["fraction"] == "750000/1",
+        f"got {n0['end']['time_us']}",
+    )
+    # Note 1: no pedal, release equals end.
+    suite.check(
+        "plain note ticks",
+        (n1["start"]["tick"], n1["release"]["tick"], n1["end"]["tick"])
+        == (0, 480, 480),
+        f"got {n1}",
+    )
+    suite.check(
+        "plain note end fraction",
+        n1["end"]["time_us"]["fraction"] == "500000/1",
+        f"got {n1['end']['time_us']}",
+    )
+    # Every instant carries the reduced {numerator, denominator, fraction}.
+    well_formed = all(
+        isinstance(n[k]["time_us"]["numerator"], int)
+        and isinstance(n[k]["time_us"]["denominator"], int)
+        and "/" in n[k]["time_us"]["fraction"]
+        for n in notes
+        for k in ("start", "release", "end")
+    )
+    suite.check("all note instants well formed", well_formed)
+
+    # -- 422 semantic failures: no partial projection ----------------------
+    def single_track(payload, fmt=1, ntracks=1, ppqn=480):
+        return header(fmt, ntracks, ppqn) + b"".join(
+            track(p) for p in payload
+        )
+
+    fail_cases = [
+        (
+            "repeated note on without release",
+            single_track([
+                note_on(0, 0, 60, 100)
+                + note_on(240, 0, 60, 90)
+                + note_off(0, 0, 60)
+                + EOT
+            ]),
+            "repeated_note_on",
+        ),
+        (
+            "release with no held key",
+            single_track([note_off(0, 0, 60) + EOT]),
+            "unmatched_note_off",
+        ),
+        (
+            "note still held at end of file",
+            single_track([note_on(0, 0, 60, 100) + EOT]),
+            "unterminated_notes",
+        ),
+        (
+            "pedal held down at end of file",
+            single_track([
+                cc(0, 0, SUSTAIN, 127)
+                + note_on(0, 0, 60, 100)
+                + note_off(100, 0, 60)
+                + EOT
+            ]),
+            "unterminated_notes",
+        ),
+        (
+            "cross-track same-tick release precedes attack",
+            header(1, 2, 480)
+            + track(note_off(0, 0, 60) + EOT)
+            + track(note_on(0, 0, 60, 100) + EOT),
+            "unmatched_note_off",
+        ),
+    ]
+    for label, payload, code in fail_cases:
+        status, body = post(payload, query)
+        err = body.get("error", {})
+        suite.check(f"{label}: HTTP 422", status == 422, f"got {status}")
+        suite.check(f"{label}: code {code}", err.get("code") == code,
+                    f"got {err.get('code')}")
+        suite.check(f"{label}: no partial projection", "notes" not in body
+                    and "events" not in body)
 
 
 def main():
