@@ -1,0 +1,32 @@
+name: midi-normalizer
+
+services:
+  app:
+    build: .
+    image: midi-normalizer:latest
+    environment:
+      PORT: 8000
+    ports:
+      # Host-side port is configurable: HOST_PORT=9000 docker compose up app
+      - "${HOST_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8000')+'/health',timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  verify:
+    image: midi-normalizer:latest
+    build: .
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_URL: http://app:8000
+    command: ["python", "-m", "verify.verify"]
+    restart: "no"
