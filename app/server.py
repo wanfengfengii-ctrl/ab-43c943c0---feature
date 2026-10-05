@@ -10,8 +10,15 @@ from __future__ import annotations
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
-from .midi import MAX_FILE_BYTES, MidiError, normalize
+from .midi import (
+    AUDIBLE_NOTES_PROJECTION,
+    MAX_FILE_BYTES,
+    MidiError,
+    ProjectionError,
+    normalize,
+)
 
 NORMALIZE_PATH = "/api/midi/normalize"
 _DRAIN_CAP = 32 << 20  # never read more than this when rejecting oversize bodies
@@ -35,12 +42,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _error(self, status: int, code: str, message: str, offset=None,
-               close: bool = False) -> None:
-        self._send_json(
-            status,
-            {"error": {"code": code, "message": message, "offset": offset}},
-            close=close,
-        )
+               close: bool = False, location=None) -> None:
+        payload = {"error": {"code": code, "message": message, "offset": offset}}
+        if location is not None:
+            payload["error"]["location"] = location
+        self._send_json(status, payload, close=close)
 
     def _drain(self, length: int) -> None:
         """Discard up to ``length`` body bytes (bounded) to keep the socket sane."""
@@ -63,10 +69,26 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "not_found", f"unknown path: {path}")
 
     def do_POST(self) -> None:
-        path = self.path.split("?", 1)[0]
+        raw_path = self.path
+        path, _, query_string = raw_path.partition("?")
         if path != NORMALIZE_PATH:
             self._error(404, "not_found", f"unknown path: {path}")
             return
+
+        projection = None
+        if query_string:
+            params = parse_qs(query_string, keep_blank_values=True)
+            values = params.get("projection")
+            if values is not None:
+                projection = values[-1]
+                if projection != AUDIBLE_NOTES_PROJECTION:
+                    self._error(
+                        400,
+                        "invalid_projection",
+                        f"unknown projection {projection!r}; supported value "
+                        f"is {AUDIBLE_NOTES_PROJECTION!r}",
+                    )
+                    return
 
         length_header = self.headers.get("Content-Length")
         if length_header is None:
@@ -102,9 +124,24 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = normalize(body)
+            result = normalize(body, projection=projection)
+        except ProjectionError as exc:
+            # Semantic projection failure (422): no partial projection is
+            # produced.  Located on the timeline (tick/track/order) rather
+            # than at a byte offset.
+            self._error(
+                422,
+                exc.code,
+                exc.message,
+                location={
+                    "tick": exc.tick,
+                    "track": exc.track,
+                    "order": exc.order,
+                },
+            )
+            return
         except MidiError as exc:
-            # Structural failure: report the locating offset, never a
+            # Structural failure: report the locating byte offset, never a
             # partial timeline.
             self._error(400, exc.code, exc.message, offset=exc.offset)
             return

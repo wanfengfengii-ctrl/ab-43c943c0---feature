@@ -13,11 +13,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 MAX_FILE_BYTES = 1 << 20  # 1 MiB
 MAX_TRACKS_PLUS_EVENTS = 10_000
 DEFAULT_TEMPO_US_PER_QUARTER = 500_000
+
+NOTE_OFF_KIND = 0x80
+NOTE_ON_KIND = 0x90
+CONTROL_CHANGE_KIND = 0xB0
+HOLD_PEDAL_CC = 64
+PEDAL_DOWN_AT = 64  # CC64 value >= 64 means the hold pedal is down
+
+AUDIBLE_NOTES_PROJECTION = "audible_notes"
 
 CHANNEL_EVENT_NAMES = {
     0x80: "note_off",
@@ -51,6 +59,39 @@ class ChannelEvent:
     kind: int  # high nibble of the status byte, e.g. 0x90
     channel: int
     data: Tuple[int, ...]
+
+
+@dataclass
+class Note:
+    """An audible note interval.
+
+    ``release_tick`` is when the key was physically released; ``end_tick``
+    is when the sound actually stops, which a held sustain pedal can push
+    past the key release.  ``attack_track``/``attack_order`` locate the
+    originating note_on for error reporting.
+    """
+
+    channel: int
+    pitch: int
+    velocity: int
+    start_tick: int
+    attack_track: int
+    attack_order: int
+    release_tick: Optional[int] = None
+    end_tick: Optional[int] = None
+
+
+class ProjectionError(Exception):
+    """The audible-notes projection is inconsistent (reported as HTTP 422)."""
+
+    def __init__(self, code: str, message: str, tick: int, track: int,
+                 order: int) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.tick = tick
+        self.track = track
+        self.order = order
 
 
 @dataclass
@@ -356,8 +397,127 @@ def time_at_tick(
     return total
 
 
-def normalize(data: bytes) -> dict:
-    """Parse ``data`` and return the normalized channel-event timeline."""
+def project_audible_notes(
+    ordered: List[ChannelEvent],
+) -> List[Note]:
+    """Build audible note intervals from the ordered channel-event timeline.
+
+    A positive-velocity note_on attacks.  A note_off or zero-velocity
+    note_on releases the held key of the same channel/pitch; while CC64 is
+    at least 64 the note merely moves to a sustaining set and keeps
+    sounding, and the first CC64 value below 64 ends every sustaining note
+    on that channel.  A re-attack of the same pitch while the previous
+    instance is still sounding (held or merely sustained) is allowed and
+    starts a new independent note.
+
+    Raises :class:`ProjectionError` on a repeated attack before release, a
+    release with no matching key, or notes still sounding at end of file.
+    """
+    # held[(channel, pitch)]: the most recent attacked note whose key is
+    # still physically down.  sustained[channel]: notes whose key is up but
+    # which keep ringing while the pedal is held.  pedal_down[channel] is
+    # the last CC64 state (a channel starts with the pedal up).
+    held: Dict[Tuple[int, int], Note] = {}
+    sustained: Dict[int, List[Note]] = {}
+    pedal_down: Dict[int, bool] = {}
+    notes: List[Note] = []
+
+    for event in ordered:
+        loc = (event.tick, event.track, event.order)
+        if event.kind in (NOTE_OFF_KIND, NOTE_ON_KIND) and len(event.data) >= 2:
+            pitch = event.data[0]
+            velocity = event.data[1]
+            is_release = event.kind == NOTE_OFF_KIND or velocity == 0
+            key = (event.channel, pitch)
+            if is_release:
+                note = held.pop(key, None)
+                if note is None:
+                    raise ProjectionError(
+                        "note_release_without_on",
+                        f"note release at tick {event.tick} (track "
+                        f"{event.track}, order {event.order}) for channel "
+                        f"{event.channel} pitch {pitch} has no key held down",
+                        *loc,
+                    )
+                note.release_tick = event.tick
+                if pedal_down.get(event.channel, False):
+                    # Key up but the pedal is holding the sound.
+                    sustained.setdefault(event.channel, []).append(note)
+                else:
+                    note.end_tick = event.tick
+            else:
+                if key in held:
+                    note = held[key]
+                    raise ProjectionError(
+                        "note_on_without_off",
+                        f"note_on at tick {event.tick} (track {event.track}, "
+                        f"order {event.order}) for channel {event.channel} "
+                        f"pitch {pitch} repeats an attack from tick "
+                        f"{note.start_tick} without a release",
+                        *loc,
+                    )
+                note = Note(
+                    channel=event.channel,
+                    pitch=pitch,
+                    velocity=velocity,
+                    start_tick=event.tick,
+                    attack_track=event.track,
+                    attack_order=event.order,
+                )
+                held[key] = note
+                notes.append(note)
+        elif event.kind == CONTROL_CHANGE_KIND and len(event.data) >= 2:
+            if event.data[0] != HOLD_PEDAL_CC:
+                continue
+            now_down = event.data[1] >= PEDAL_DOWN_AT
+            if now_down:
+                pedal_down[event.channel] = True
+                continue
+            if not pedal_down.get(event.channel, False):
+                continue  # already up: nothing sustained can be waiting
+            pedal_down[event.channel] = False
+            for note in sustained.pop(event.channel, []):
+                note.end_tick = event.tick
+
+    # End of file: any note whose key never came up is malformed...
+    for note in held.values():
+        raise ProjectionError(
+            "note_unclosed",
+            f"note attacked at tick {note.start_tick} (track "
+            f"{note.attack_track}, order {note.attack_order}) on channel "
+            f"{note.channel} pitch {note.pitch} is never released before "
+            "end of file",
+            note.start_tick,
+            note.attack_track,
+            note.attack_order,
+        )
+    # ...as is a note still ringing under a held pedal.
+    for channel, pending in sustained.items():
+        if pending:
+            note = pending[0]
+            raise ProjectionError(
+                "note_unclosed",
+                f"note attacked at tick {note.start_tick} (track "
+                f"{note.attack_track}, order {note.attack_order}) on "
+                f"channel {channel} pitch {note.pitch} is still sustaining "
+                "at end of file",
+                note.start_tick,
+                note.attack_track,
+                note.attack_order,
+            )
+
+    # Re-attacks preserve every instance; release/end fall out of the
+    # sustaining set semantics above.  Notes are already in attack order.
+    return notes
+
+
+def normalize(data: bytes, projection: Optional[str] = None) -> dict:
+    """Parse ``data`` and return the normalized channel-event timeline.
+
+    With ``projection="audible_notes"`` the response additionally carries a
+    ``notes`` list; projection inconsistencies raise
+    :class:`ProjectionError`.
+    """
     parsed = parse(data)
     segments = build_tempo_segments(parsed.tempo_events)
     ordered = sorted(
@@ -381,10 +541,43 @@ def normalize(data: bytes) -> dict:
                 },
             }
         )
-    return {
+    result = {
         "format": parsed.fmt,
         "ppqn": parsed.ppqn,
         "track_count": parsed.ntracks,
         "channel_event_count": len(events),
         "events": events,
     }
+    if projection == AUDIBLE_NOTES_PROJECTION:
+        result["notes"] = _notes_payload(
+            project_audible_notes(ordered), segments, parsed.ppqn
+        )
+    return result
+
+
+def _tick_time(tick: int, segments, ppqn: int) -> dict:
+    moment = time_at_tick(tick, segments, ppqn)
+    return {
+        "numerator": moment.numerator,
+        "denominator": moment.denominator,
+        "fraction": f"{moment.numerator}/{moment.denominator}",
+    }
+
+
+def _notes_payload(notes: List[Note], segments, ppqn: int) -> List[dict]:
+    payload = []
+    for note in notes:
+        payload.append(
+            {
+                "channel": note.channel,
+                "pitch": note.pitch,
+                "velocity": note.velocity,
+                "start_tick": note.start_tick,
+                "release_tick": note.release_tick,
+                "end_tick": note.end_tick,
+                "start_us": _tick_time(note.start_tick, segments, ppqn),
+                "release_us": _tick_time(note.release_tick, segments, ppqn),
+                "end_us": _tick_time(note.end_tick, segments, ppqn),
+            }
+        )
+    return payload

@@ -91,6 +91,45 @@ def build_smoke_file():
     return header(1, 3, 480) + track(conductor) + track(piano) + track(strings)
 
 
+def build_projection_file():
+    """Format 1, PPQN 480, three tracks exercising the audible-notes view.
+
+    Tempo map: 500000 us/qn until tick 480, 250000 afterwards.  Track 1
+    plays channel 0 under a hold pedal (CC64) that lifts at tick 960; track
+    2 plays channel 1 without a pedal, and at tick 960 track 1 attacks ch0
+    pitch 67 which track 2 releases at the very same tick -- a cross-track
+    same-tick pairing resolved by track order.
+    """
+    conductor = tempo(0, 500000) + tempo(480, 250000) + EOT
+    keys_a = (
+        ev(0, 0xB0, 64, 127)        # tick 0   pedal down (ch0)
+        + ev(0, 0x90, 60, 100)      # tick 0   attack p60
+        + ev(240, 0x80, 60, 0)      # tick 240 key up, still sustaining
+        + ev(240, 0x90, 62, 110)    # tick 480 attack p62
+        + ev(240, 0x80, 62, 0)      # tick 720 key up, still sustaining
+        + ev(240, 0xB0, 64, 0)      # tick 960 pedal up: p60/p62 end
+        + ev(0, 0x90, 67, 90)       # tick 960 attack p67 (track 1 first)
+        + EOT
+    )
+    keys_b = (
+        ev(480, 0x91, 65, 80)       # tick 480 attack ch1 p65 (no pedal)
+        + ev(240, 0x81, 65, 0)      # tick 720 release/end p65
+        + ev(240, 0x80, 67, 0)      # tick 960 cross-track release of p67
+        + EOT
+    )
+    return header(1, 3, 480) + track(conductor) + track(keys_a) + track(keys_b)
+
+
+# Expected audible notes for build_projection_file(): channel, pitch,
+# velocity, (start, release, end) ticks, (start, release, end) microseconds.
+EXPECTED_NOTES = [
+    (0, 60, 100, (0, 240, 960), ("0/1", "250000/1", "750000/1")),
+    (0, 62, 110, (480, 720, 960), ("500000/1", "625000/1", "750000/1")),
+    (1, 65, 80, (480, 720, 720), ("500000/1", "625000/1", "625000/1")),
+    (0, 67, 90, (960, 960, 960), ("750000/1", "750000/1", "750000/1")),
+]
+
+
 # Expected timeline for build_smoke_file(): (tick, track, order, type,
 # channel, data, fraction-of-microseconds).
 EXPECTED_EVENTS = [
@@ -108,9 +147,10 @@ EXPECTED_EVENTS = [
 # -- helpers -----------------------------------------------------------------
 
 
-def post(body):
+def post(body, query=""):
+    url = APP_URL + "/api/midi/normalize" + query
     request = urllib.request.Request(
-        APP_URL + "/api/midi/normalize",
+        url,
         data=body,
         headers={"Content-Type": "application/octet-stream"},
         method="POST",
@@ -271,6 +311,132 @@ def step_api_smoke():
     suite.check(
         "oversize body: code",
         body.get("error", {}).get("code") == "payload_too_large",
+        f"got {body}",
+    )
+
+    # -- audible-notes projection: compatibility when omitted --------------
+    status, body = post(build_projection_file())
+    suite.check("projection omitted: still 200", status == 200, f"got {status}")
+    suite.check(
+        "projection omitted: no notes key", "notes" not in body, f"got {body}"
+    )
+
+    # -- audible-notes projection: happy path -------------------------------
+    status, body = post(
+        build_projection_file(), "?projection=audible_notes"
+    )
+    suite.check("projection: status 200", status == 200, f"got {status}: {body}")
+    if status != 200:
+        return not suite.failures
+    suite.check("projection: events preserved", len(body.get("events", [])) == 10,
+                f"got {len(body.get('events', []))}")
+    notes = body.get("notes", [])
+    suite.check("projection: 4 notes", len(notes) == 4, f"got {len(notes)}")
+    for i, expected in enumerate(EXPECTED_NOTES):
+        if i >= len(notes):
+            break
+        channel, pitch, velocity, ticks, times = expected
+        got = notes[i]
+        suite.check(
+            f"note {i} identity",
+            (got.get("channel"), got.get("pitch"), got.get("velocity"))
+            == (channel, pitch, velocity),
+            f"got ch={got.get('channel')} p={got.get('pitch')} "
+            f"v={got.get('velocity')}",
+        )
+        suite.check(
+            f"note {i} ticks {ticks}",
+            (got.get("start_tick"), got.get("release_tick"),
+             got.get("end_tick")) == ticks,
+            f"got {(got.get('start_tick'), got.get('release_tick'), got.get('end_tick'))}",
+        )
+        suite.check(
+            f"note {i} times {times}",
+            (got.get("start_us", {}).get("fraction"),
+             got.get("release_us", {}).get("fraction"),
+             got.get("end_us", {}).get("fraction")) == times,
+            f"got {got.get('start_us')} / {got.get('release_us')} / "
+            f"{got.get('end_us')}",
+        )
+        # Fractions must be in reduced form.
+        for point in ("start_us", "release_us", "end_us"):
+            blob = got.get(point, {})
+            num, den = blob.get("numerator"), blob.get("denominator")
+            suite.check(
+                f"note {i} {point} is reduced fraction",
+                isinstance(num, int) and isinstance(den, int)
+                and blob.get("fraction") == f"{num}/{den}",
+                f"got {blob}",
+            )
+    # Notes are ordered by attack: (tick, then track of the attack).
+    attack_keys = [(n["start_tick"], n["channel"], n["pitch"]) for n in notes]
+    suite.check(
+        "notes in attack order",
+        attack_keys == sorted(attack_keys),
+        f"got {attack_keys}",
+    )
+
+    # -- audible-notes projection: failure regressions (HTTP 422) ----------
+    def one_track(payload, ppqn=480):
+        return header(1, 1, ppqn) + track(payload)
+
+    failure_cases = [
+        (
+            "repeat attack without release",
+            one_track(
+                ev(0, 0x90, 60, 100)
+                + ev(100, 0x90, 60, 100)
+                + ev(10, 0x80, 60, 0)
+                + EOT
+            ),
+            "note_on_without_off",
+        ),
+        (
+            "release without key",
+            one_track(ev(0, 0x80, 60, 0) + EOT),
+            "note_release_without_on",
+        ),
+        (
+            "still sustaining at end of file",
+            one_track(
+                ev(0, 0xB0, 64, 127)
+                + ev(0, 0x90, 60, 100)
+                + ev(100, 0x80, 60, 0)
+                + EOT
+            ),
+            "note_unclosed",
+        ),
+    ]
+    for label, payload, code in failure_cases:
+        status, body = post(payload, "?projection=audible_notes")
+        err = body.get("error", {})
+        suite.check(f"{label}: HTTP 422", status == 422, f"got {status}: {body}")
+        suite.check(f"{label}: code {code}", err.get("code") == code,
+                    f"got {err.get('code')}")
+        loc = err.get("location")
+        suite.check(
+            f"{label}: timeline location",
+            isinstance(loc, dict) and set(loc) == {"tick", "track", "order"},
+            f"got {loc}",
+        )
+        suite.check(f"{label}: no partial projection", "notes" not in body)
+
+    # A structurally broken file stays a 400 even with the projection on.
+    status, body = post(
+        header(0, 1, 480) + track(ev(0, 0xF8)),
+        "?projection=audible_notes",
+    )
+    suite.check("structural error under projection: HTTP 400",
+                status == 400, f"got {status}")
+    suite.check("structural error under projection: no notes",
+                "notes" not in body)
+
+    # An unknown projection value is a 400 parameter error.
+    status, body = post(build_projection_file(), "?projection=score")
+    suite.check("unknown projection: HTTP 400", status == 400, f"got {status}")
+    suite.check(
+        "unknown projection: code",
+        body.get("error", {}).get("code") == "invalid_projection",
         f"got {body}",
     )
 

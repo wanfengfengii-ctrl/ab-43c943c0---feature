@@ -34,6 +34,42 @@ Docker 构建无需安装任何依赖。
 }
 ```
 
+**可听音符投影**：追加查询参数 `?projection=audible_notes` 后，成功响应在保留
+`events` 的同时按起音顺序增加 `notes`，逐项区分按键释放与真正结束发声：
+
+```json
+{
+  "channel": 0,
+  "pitch": 60,
+  "velocity": 100,
+  "start_tick": 0,
+  "release_tick": 240,
+  "end_tick": 960,
+  "start_us":   {"numerator": 0,      "denominator": 1, "fraction": "0/1"},
+  "release_us": {"numerator": 250000, "denominator": 1, "fraction": "250000/1"},
+  "end_us":     {"numerator": 750000, "denominator": 1, "fraction": "750000/1"}
+}
+```
+
+- 正力度 `note_on` 起音；`note_off` 或零力度 `note_on` 释放同通道同音高按键。
+- CC64（延音踏板）值 ≥ 64 期间，释放只记录 `release_tick`，声音继续延音；
+  CC64 首次降到 64 以下时，该通道全部待延音音符在同一 tick 结束（`end_tick`）。
+  踏板状态按通道独立，初始为抬起；无踏板时释放即结束。
+- 延音中允许同音高再次起音，两次起音各自独立；同刻事件沿用
+  `(tick, track, order)` 次序。
+- 投影冲突返回 **422** 且无部分投影（响应不含 `notes`）：未释放即重复起音
+  （`note_on_without_off`）、无对应按键的释放（`note_release_without_on`）、
+  文件结束仍有未结束音符（`note_unclosed`，含踏板仍踩住的延音）。错误体在
+  `location` 中给出 `tick`/`track`/`order` 定位：
+
+```json
+{"error": {"code": "note_on_without_off", "message": "...", "offset": null,
+           "location": {"tick": 100, "track": 0, "order": 1}}}
+```
+
+省略 `projection` 时响应、排序与错误语义完全不变；未知的 projection 值返回
+400 `invalid_projection`。
+
 **结构错误（400）**：返回可定位的字节偏移，绝不返回部分时间轴：
 
 ```json
@@ -64,7 +100,8 @@ HOST_PORT=9000 docker compose up app     # 可配置宿主机端口
 ## 验证（一次性 verify 服务）
 
 verify 服务在 app 健康检查通过后依次执行：单元测试 → 构建检查
-（compileall + 模块导入）→ 含变速多轨文件的 API 冒烟（含错误用例），
+（compileall + 模块导入）→ 含变速多轨文件的 API 冒烟（含错误用例，以及
+跨轨同刻、变速、延音与 422 失败回归的 audible_notes 投影），
 并以退出码报告结论（0 = 通过）：
 
 ```bash
@@ -84,9 +121,9 @@ APP_URL=http://127.0.0.1:8000 python3 -m verify.verify
 ## 结构
 
 ```
-app/midi.py      严格 SMF 解析、节拍表、精确分数时间
+app/midi.py      严格 SMF 解析、节拍表、精确分数时间、audible_notes 投影
 app/server.py    HTTP 前端（stdlib http.server）
-tests/           单元测试（41 例）
+tests/           单元测试（63 例，含延音投影语义）
 verify/          一次性验证服务（测试 + 构建检查 + API 冒烟）
 Dockerfile       python:3.12-slim，无依赖安装
 docker-compose.yml  app（健康检查、可配置宿主机端口）+ verify
